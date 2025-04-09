@@ -386,9 +386,10 @@ def configure_optimizers(self, weight_decay, learning_rate, device_type):
 import os
 import torch
 import numpy as np
-import tiktoken  # retained in case of future tokenization needs
+import tiktoken
+from typing import Tuple  # Import Tuple for type annotations
 
-def load_tokens(filename):
+def load_tokens(filename: str) -> torch.Tensor:
     """
     Loads tokenized data from a .npy file and converts it to a torch.Tensor.
     
@@ -403,90 +404,91 @@ def load_tokens(filename):
     token_tensor = torch.tensor(np_tokens, dtype=torch.long)
     return token_tensor
 
-
 class DataLoaderLite:
     """
     A lightweight data loader to iterate over tokenized data stored in shards.
 
-    This loader manages a list of shard files for a particular split (train or val)
+    This loader manages a list of shard files for a given dataset split ('train' or 'val')
     and provides batches for language modeling by slicing the tokenized data.
 
     Attributes:
-        batch_size (int): Number of samples per batch.
-        seq_length (int): Sequence length (context window size) for each sample.
-        split (str): Indicates either 'train' or 'val' dataset.
-        shards (list): List of full paths to shard files.
+        batch_size (int): Number of samples (sequences) per batch.
+        seq_length (int): Number of tokens per sequence (context window).
+        split (str): Specifies the dataset split, must be either 'train' or 'val'.
+        shards (list[str]): Full paths to token shard files.
+        tokens (torch.Tensor): Tokenized data from the current shard.
         current_shard (int): Index of the currently loaded shard.
-        tokens (torch.Tensor): Token data from the current shard.
-        current_position (int): Current reading position in the token data.
+        current_position (int): Current reading position in the token stream.
     """
-    
-    def __init__(self, batch_size, seq_length, split):
+    def __init__(self, batch_size: int, seq_length: int, split: str) -> None:
         """
         Initializes the DataLoaderLite.
 
         Args:
             batch_size (int): Number of samples per batch.
             seq_length (int): Sequence length (context window) for each sample.
-            split (str): Dataset split, must be either 'train' or 'val'.
+            split (str): Must be either 'train' or 'val'.
         """
-        self.batch_size = batch_size
-        self.seq_length = seq_length
-        
         if split not in {'train', 'val'}:
             raise ValueError("`split` must be either 'train' or 'val'")
+
+        self.batch_size = batch_size
+        self.seq_length = seq_length
         self.split = split
 
         # Define the root directory containing shard files.
         data_root = "edu_fineweb10B"
         shard_files = os.listdir(data_root)
         # Filter shards according to the desired split.
-        shard_files = [filename for filename in shard_files if split in filename]
+        shard_files = [s for s in shard_files if split in s]
         shard_files = sorted(shard_files)
         # Full paths to each shard file.
-        self.shards = [os.path.join(data_root, filename) for filename in shard_files]
+        self.shards = [os.path.join(data_root, s) for s in shard_files]
         if len(self.shards) == 0:
             raise ValueError(f"No shards found for split '{split}'")
+        # For single-device setup, always log this information.
         print(f"Found {len(self.shards)} shards for split '{split}'")
 
         self.reset()
 
-    def reset(self):
+    def reset(self) -> None:
         """
-        Resets the data loader to the beginning of the data (starting at the first shard).
+        Resets the data loader to start from the beginning of the first shard.
         """
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = 0
 
-    def next_batch(self):
+    def next_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Retrieves the next batch of tokenized data.
-        
+
         Returns:
-            tuple: A tuple (x, y) where:
-                x (torch.Tensor): Input tensor of shape (batch_size, seq_length).
-                y (torch.Tensor): Target tensor of shape (batch_size, seq_length).
+            Tuple[torch.Tensor, torch.Tensor]: A tuple (x, y) where:
+                - x has shape (batch_size, seq_length) as input tokens.
+                - y has shape (batch_size, seq_length) as target tokens (x shifted by one token).
         """
-        total_tokens_required = self.batch_size * self.seq_length
-        # Extract a buffer of tokens sufficient for a full batch plus one extra token for targets.
-        batch_buffer = self.tokens[self.current_position : self.current_position + total_tokens_required + 1]
-        
-        # If there are insufficient tokens left in the current shard, load the next shard.
-        if batch_buffer.size(0) < total_tokens_required + 1:
+        B = self.batch_size
+        T = self.seq_length
+        # Calculate number of tokens needed for a full batch plus one extra token for targets.
+        total_tokens_needed = B * T + 1
+        buffer = self.tokens[self.current_position : self.current_position + total_tokens_needed]
+
+        # If there are not enough tokens in the current shard, load the next shard.
+        if buffer.size(0) < total_tokens_needed:
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = 0
-            batch_buffer = self.tokens[self.current_position : self.current_position + total_tokens_required + 1]
-            if batch_buffer.size(0) < total_tokens_required + 1:
+            buffer = self.tokens[self.current_position : self.current_position + total_tokens_needed]
+            if buffer.size(0) < total_tokens_needed:
                 raise ValueError("Not enough tokens in the shard to create a full batch.")
-        
-        # Create input and target batches. The target is the input shifted by one token.
-        x = batch_buffer[:-1].view(self.batch_size, self.seq_length)
-        y = batch_buffer[1:].view(self.batch_size, self.seq_length)
-        
-        # Advance the reading position for the next batch.
-        self.current_position += total_tokens_required
+
+        # Create input and target sequences.
+        x = buffer[:-1].view(B, T)  # Inputs.
+        y = buffer[1:].view(B, T)   # Targets (shifted by one token).
+
+        # Update the current reading position for the next batch.
+        self.current_position += B * T
         return x, y
 
 
@@ -593,8 +595,9 @@ print(f"Calculated gradient accumulation steps: {grad_accum_steps}")
 # =============================================================================
 # For a single-GPU/CPU run, process_rank is 0 and num_processes is 1.
 # DataLoaderLite is assumed to be defined elsewhere.
-train_loader = DataLoaderLite(B=micro_batch_size, T=seq_length, process_rank=0, num_processes=1, split="train")
-val_loader   = DataLoaderLite(B=micro_batch_size, T=seq_length, process_rank=0, num_processes=1, split="val")
+train_loader = DataLoaderLite(batch_size=micro_batch_size, seq_length=seq_length, split="train")
+val_loader   = DataLoaderLite(batch_size=micro_batch_size, seq_length=seq_length, split="val")
+
 
 # =============================================================================
 # 6. Set Matmul Precision
